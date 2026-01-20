@@ -1,0 +1,50 @@
+[package]
+name = "todo-mcp"
+version = "0.1.0"
+authors = ["cetra3 <cetra3@hotmail.com>"]
+description = "A Collaborative Todo List application and MCP server using CRDTs and Multicast"
+edition = "2024"
+license = "AGPL-3.0"
+repository = "https://github.com/cetra3/todo-mcp"
+readme = "README.md"
+
+[dependencies]
+dioxus = { version = "0.7.3", features = [] }
+
+# MCP and networking
+rmcp = { version = "0.14.0", features = ["transport-io"] }
+tokio = { version = "1.49.0", features = ["full"] }
+socket2 = "0.6.2"
+
+# CRDT / state sync
+automerge = "0.7.3"
+autosurgeon = "0.10.1"
+
+# Serialization
+serde = { version = "1.0.228", features = ["derive"] }
+bincode = { version = "2.0.1", features = ["serde"] }
+schemars = "1.2.0"
+
+# Utilities
+rand = "0.9.2"
+shellexpand = "3.1.1"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter", "json"] }
+tracing-error = "0.2.1"
+clap = { version = "4.5.56", features = ["derive", "env"] }
+serde_json = "1.0.149"
+tokio-util = { version = "0.7.18", features = ["codec", "io"] }
+futures = "0.3.31"
+fs2 = "0.4.3"
+pin-project-lite = "0.2.16"
+anyhow = { version = "1.0.100", features = ["backtrace"] }
+netwatcher = "0.4.1"
+
+[features]
+default = ["desktop"]
+# The feature that are only required for the web = ["dioxus/web"] build target should be optional and only enabled in the web = ["dioxus/web"] feature
+web = ["dioxus/web"]
+# The feature that are only required for the desktop = ["dioxus/desktop"] build target should be optional and only enabled in the desktop = ["dioxus/desktop"] feature
+desktop = ["dioxus/desktop"]
+# The feature that are only required for the mobile = ["dioxus/mobile"] build target should be optional and only enabled in the mobile = ["dioxus/mobile"] feature
+mobile = ["dioxus/mobile"]

@@ -1,0 +1,25 @@
+[application]
+android_manifest = "./AndroidManifest.xml"
+
+[bundle]
+identifier = "dev.cetra.todomcp"
+
+[web.app]
+
+# HTML title tag content
+title = "todo-mcp"
+
+# include `assets` in web platform
+[web.resource]
+
+# Additional CSS style files
+style = []
+
+# Additional JavaScript files
+script = []
+
+[web.resource.dev]
+
+# Javascript code file
+# serve: [dev-server] only
+script = []
