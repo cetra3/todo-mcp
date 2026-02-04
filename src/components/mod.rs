@@ -69,7 +69,7 @@ impl<Lens> Store<TodoState, Lens> {
 }
 
 pub static TODOS: GlobalStore<Vec<TodoList>> = Global::new(|| Vec::new());
-pub static ALIVE_CONNECTIONS: GlobalStore<usize> = Global::new(|| 0);
+pub static CONNECTION_STATE: GlobalStore<String> = Global::new(|| String::new());
 
 impl TodoState {
     pub fn new() -> Self {
@@ -98,8 +98,8 @@ impl TodoState {
                             })
                             .collect();
                     }
-                    TodoEvent::AliveConnections(count) => {
-                        let mut alive_connections = ALIVE_CONNECTIONS.write();
+                    TodoEvent::ConnectionStatus(count) => {
+                        let mut alive_connections = CONNECTION_STATE.write();
                         *alive_connections = count;
                     }
                 }

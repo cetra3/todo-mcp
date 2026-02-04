@@ -14,14 +14,14 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use tracing::*;
 
 use tokio::sync::mpsc::{
-    channel as tokio_channel, Receiver as TokioReceiver, Sender as TokioSender,
+    Receiver as TokioReceiver, Sender as TokioSender, channel as tokio_channel,
 };
 
-use tokio::sync::oneshot::{channel as oneshot_channel, Sender as OneshotSender};
+use tokio::sync::oneshot::{Sender as OneshotSender, channel as oneshot_channel};
 
 use tokio::sync::{Notify, RwLock};
 
-use autosurgeon::{hydrate, reconcile, Hydrate, Reconcile};
+use autosurgeon::{Hydrate, Reconcile, hydrate, reconcile};
 use std::sync::Arc;
 
 use crate::backends::proto::{McastReceiver, McastSender, ProtoMessage};
@@ -63,7 +63,7 @@ impl TodoList {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TodoEvent {
     StateUpdate(TodoState),
-    AliveConnections(usize),
+    ConnectionStatus(String),
 }
 
 #[derive(Debug, Default, Clone, Reconcile, Hydrate, PartialEq, Serialize, Deserialize)]
@@ -206,18 +206,17 @@ impl SiteState {
                 alive_count_before, alive_count_after
             );
 
-            tx.send(TodoEvent::AliveConnections(alive_count_after))
-                .await?;
+            tx.send(TodoEvent::ConnectionStatus(format!(
+                "Connections: {}",
+                alive_count_after
+            )))
+            .await?;
         }
 
         Ok(())
     }
 
-    async fn merge(
-        &mut self,
-        val: Vec<u8>,
-    ) -> Result<()> {
-
+    async fn merge(&mut self, val: Vec<u8>) -> Result<()> {
         let mut other = AutoCommit::load(&val)?;
 
         let current_value: TodoState = hydrate(&self.commit)?;
@@ -241,8 +240,11 @@ impl SiteState {
         incoming_site_id: u32,
     ) -> Result<()> {
         self.alive.remove(&incoming_site_id);
-        tx.send(TodoEvent::AliveConnections(self.alive.len()))
-            .await?;
+        tx.send(TodoEvent::ConnectionStatus(format!(
+            "Site Disconnected, Connections: {}",
+            self.alive.len()
+        )))
+        .await?;
         Ok(())
     }
 }
@@ -380,10 +382,12 @@ pub async fn async_inner(
         tokio::select! {
             _ = network_notify.notified() => {
                 debug!("network watcher notified");
+                change_tx.send(TodoEvent::ConnectionStatus("Network status changed".into())).await?;
             }
             result = read_task => {
                 // the write task has finished with the receiver, we need to reinitialize
                 if let Err(err) = result {
+                    change_tx.send(TodoEvent::ConnectionStatus("Error reading from network, trying reconnect in 10s".into())).await?;
                     error!("Error reading from multicast sleeping 10s and trying again, {err:?}");
                 }
             }
@@ -391,6 +395,7 @@ pub async fn async_inner(
 
                 // the write task has finished with the receiver, we need to reinitialize
                 if let Err(err) = result {
+                    change_tx.send(TodoEvent::ConnectionStatus("Error writing to network, trying reconnect in 10s".into())).await?;
                     error!("Error writing to multicast sleeping 10s and trying again, {err:?}");
                 }
             }
@@ -406,6 +411,10 @@ pub async fn async_inner(
                 debug!("network watcher notified, trying again");
             }
         }
+
+        change_tx
+            .send(TodoEvent::ConnectionStatus("Reconnecting".into()))
+            .await?;
 
         read_task = read_from_multicast(multi_write_tx.clone());
         write_task = write_to_multicast(site_id, site.clone(), &mut m_write_rx);
@@ -485,7 +494,7 @@ pub async fn read_notify(
     // Update aliveness every second
     join_set.spawn(async move {
         loop {
-            let mut announce_interval = tokio::time::interval(Duration::from_secs(1));
+            let mut announce_interval = tokio::time::interval(Duration::from_secs(5));
 
             announce_interval.tick().await;
 
@@ -528,8 +537,25 @@ pub async fn read_notify(
                         .await?;
                 }
             }
-            SyncMessage::State(val) => {
-                debug!("Site:{} State:{}", incoming_site_id, val.len());
+
+            message @ (SyncMessage::State(_) | SyncMessage::Announce(_)) => {
+                let is_announce = matches!(message, SyncMessage::Announce(_));
+
+                let val = match message {
+                    SyncMessage::State(val) => val,
+                    SyncMessage::Announce(val) => val,
+                    _ => unreachable!(),
+                };
+
+                if is_announce {
+                    debug!(
+                        "Announce from Site:{}, State:{}, sending our state",
+                        incoming_site_id,
+                        val.len()
+                    );
+                } else {
+                    debug!("Site:{} State:{}", incoming_site_id, val.len());
+                }
                 let mut wrt = site.write().await;
 
                 wrt.merge(val).await?;
@@ -540,6 +566,12 @@ pub async fn read_notify(
                 state_set.insert(incoming_site_id);
 
                 should_notify_save = true;
+
+                if is_announce {
+                    m_write_tx
+                        .send(SyncMessage::State(wrt.commit.save()))
+                        .await?;
+                }
             }
             SyncMessage::RequestState(requested_site_id) => {
                 debug!(
@@ -551,22 +583,6 @@ pub async fn read_notify(
                         .send(SyncMessage::State(site.write().await.commit.save()))
                         .await?;
                 }
-            }
-            SyncMessage::Announce(val) => {
-                debug!("Announce from Site:{}, State:{}, sending our state", incoming_site_id, val.len());
-
-                let mut wrt = site.write().await;
-
-                wrt.merge(val).await?;
-                wrt.update_aliveness(&change_tx, Some(incoming_site_id))
-                    .await?;
-
-                state_set.insert(incoming_site_id);
-                should_notify_save = true;
-
-                m_write_tx
-                    .send(SyncMessage::State(wrt.commit.save()))
-                    .await?;
             }
             SyncMessage::Alive => {
                 debug!("Alive from Site:{}", incoming_site_id);

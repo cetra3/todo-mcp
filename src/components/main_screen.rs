@@ -4,7 +4,7 @@ use dioxus::prelude::*;
 
 use crate::{
     backends::TodoCommand,
-    components::{ALIVE_CONNECTIONS, TODOS, TodoList, TodoState, TodoStateStoreImplExt},
+    components::{CONNECTION_STATE, TODOS, TodoList, TodoState, TodoStateStoreImplExt},
 };
 
 use super::TodoTab;
@@ -15,7 +15,7 @@ pub fn MainScreen() -> Element {
 
     let mut todos = TODOS.resolve();
 
-    let alive_connections = ALIVE_CONNECTIONS.read();
+    let connection_state = CONNECTION_STATE.read();
 
     rsx! {
         div { class: "flex flex-col min-h-screen",
@@ -79,11 +79,7 @@ pub fn MainScreen() -> Element {
         div {
             class: "mt-auto p-4 text-gray-500 flex items-center justify-center text-sm",
             em {
-                if *alive_connections != 1 {
-                    "{alive_connections} Connections"
-                } else {
-                    "{alive_connections} Connection"
-                }
+                "{connection_state}"
             }
         }
         }
