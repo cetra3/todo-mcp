@@ -38,6 +38,7 @@ impl<D: DeserializeOwned> McastReceiver<D> {
         let recv_socket = Socket::new(Domain::IPV4, Type::DGRAM, None)?;
         recv_socket.join_multicast_v4(&Ipv4Addr::new(239, 1, 1, 1), &Ipv4Addr::new(0, 0, 0, 0))?;
         recv_socket.set_reuse_address(true)?;
+        recv_socket.set_reuse_port(true)?;
         recv_socket.set_nonblocking(true)?;
         recv_socket.bind(&"0.0.0.0:1111".parse::<SocketAddr>()?.into())?;
 
