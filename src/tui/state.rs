@@ -82,6 +82,22 @@ impl EditState {
             self.cursor += next;
         }
     }
+
+    pub fn is_rename_list(&self, list_idx: usize) -> bool {
+        matches!(self.target, EditTarget::RenameList { list_index } if list_index == list_idx)
+    }
+
+    pub fn is_edit_item(&self, list_idx: usize, item_idx: usize) -> bool {
+        matches!(self.target, EditTarget::EditItem { list_index, item_index } if list_index == list_idx && item_index == item_idx)
+    }
+
+    pub fn is_new_item(&self, list_idx: usize) -> bool {
+        matches!(self.target, EditTarget::NewItem { list_index } if list_index == list_idx)
+    }
+
+    pub fn is_new_list(&self) -> bool {
+        matches!(self.target, EditTarget::NewList)
+    }
 }
 
 #[derive(Debug, Clone)]

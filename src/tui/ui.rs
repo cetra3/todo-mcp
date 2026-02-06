@@ -7,7 +7,7 @@ use ratatui::{
 };
 
 use super::colors::{todo_color, todo_fg};
-use super::state::{EditTarget, Focus, TuiState};
+use super::state::{EditState, Focus, TuiState};
 
 const COLLAPSED_HEIGHT: u16 = 4; // blank + title + counts + blank
 const ITEM_HEIGHT: u16 = 1;
@@ -15,21 +15,21 @@ const LIST_HEADER_HEIGHT: u16 = 2; // blank + title
 const ADD_ITEM_ROW_HEIGHT: u16 = 1;
 const ADD_LIST_ROW_HEIGHT: u16 = 2;
 
+fn list_block_height(item_count: u16, expanded: bool) -> u16 {
+    if expanded {
+        LIST_HEADER_HEIGHT + item_count * ITEM_HEIGHT + ADD_ITEM_ROW_HEIGHT + 1
+    } else {
+        COLLAPSED_HEIGHT
+    }
+}
+
 /// Calculate total content height needed for all lists.
 fn content_height(state: &TuiState) -> u16 {
     let mut h: u16 = 0;
     for (i, list) in state.todo_state.lists.iter().enumerate() {
         let expanded = state.list_ui.get(i).is_some_and(|u| u.expanded);
-        if expanded {
-            h += LIST_HEADER_HEIGHT
-                + (list.items.len() as u16) * ITEM_HEIGHT
-                + ADD_ITEM_ROW_HEIGHT
-                + 1; // bottom border
-        } else {
-            h += COLLAPSED_HEIGHT;
-        }
+        h += list_block_height(list.items.len() as u16, expanded);
     }
-    // "Add New Todo List" row
     h += ADD_LIST_ROW_HEIGHT;
     h
 }
@@ -62,8 +62,8 @@ fn draw_title_bar(f: &mut Frame, area: Rect) {
 
 fn draw_status_bar(f: &mut Frame, area: Rect, state: &TuiState) {
     let mode_hint = match state.focus {
-        Focus::ListSelector => "j/k:nav  Enter:expand  a:add  d:del  r:rename  q:quit",
-        Focus::ItemList => "j/k:nav  Space:toggle  a:add  d:del  e:edit  r:rename list  q:quit  Esc:back",
+        Focus::ListSelector => "Enter:expand  a:add  d:del  r:rename  q:quit",
+        Focus::ItemList => "Space:toggle  a:add  d:del  e:edit  r:rename list  q:quit  Esc:back",
         Focus::Editing => "Enter:confirm  Esc:cancel",
     };
 
@@ -93,22 +93,14 @@ fn draw_content(f: &mut Frame, area: Rect, state: &mut TuiState) {
         let expanded = state.list_ui.get(i).is_some_and(|u| u.expanded);
         let is_selected = i == state.selected_list;
 
+        let block_h = list_block_height(list.items.len() as u16, expanded);
+        let r = Rect::new(area.x, area.y.saturating_add_signed(y), area.width, block_h);
         if expanded {
-            let item_count = list.items.len() as u16;
-            let block_h = LIST_HEADER_HEIGHT + item_count * ITEM_HEIGHT + ADD_ITEM_ROW_HEIGHT + 1;
-            let r = Rect::new(area.x, area.y.saturating_add_signed(y), area.width, block_h);
             draw_expanded_list(f, area, r, state, i, is_selected);
-            y += block_h as i16;
         } else {
-            let r = Rect::new(
-                area.x,
-                area.y.saturating_add_signed(y),
-                area.width,
-                COLLAPSED_HEIGHT,
-            );
             draw_collapsed_list(f, area, r, state, i, is_selected);
-            y += COLLAPSED_HEIGHT as i16;
         }
+        y += block_h as i16;
     }
 
     // "Add New Todo List" row
@@ -140,6 +132,32 @@ fn clip(area: Rect, widget_rect: Rect) -> Option<Rect> {
     Some(Rect::new(widget_rect.x, top, widget_rect.width, bot - top))
 }
 
+/// Render a single-line edit field (prefix spans + underlined buffer) and position the cursor.
+fn render_edit_line(
+    f: &mut Frame,
+    vis: Rect,
+    clip_area: Rect,
+    prefix: Vec<Span<'_>>,
+    edit: &EditState,
+    buf_style: Style,
+    line_style: Style,
+) {
+    let prefix_width: u16 = prefix.iter().map(|s| s.content.len() as u16).sum();
+    let mut spans = prefix;
+    spans.push(Span::styled(
+        &edit.buffer,
+        buf_style.add_modifier(Modifier::UNDERLINED),
+    ));
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).style(line_style),
+        vis,
+    );
+    let cx = vis.x + prefix_width + edit.cursor as u16;
+    if cx < vis.x + vis.width && vis.y >= clip_area.y && vis.y < clip_area.y + clip_area.height {
+        f.set_cursor_position(Position::new(cx, vis.y));
+    }
+}
+
 fn draw_collapsed_list(
     f: &mut Frame,
     clip_area: Rect,
@@ -155,67 +173,45 @@ fn draw_collapsed_list(
     let list = &state.todo_state.lists[list_idx];
     let completed = list.items.iter().filter(|i| i.completed).count();
     let total = list.items.len();
-
     let bg = todo_color(&list.title, list_idx, 93);
     let fg = todo_fg(&list.title, list_idx);
+    let active = is_selected && state.focus == Focus::ListSelector;
 
-    let editing_title = matches!(
-        &state.edit,
-        Some(edit) if matches!(edit.target, EditTarget::RenameList { list_index } if list_index == list_idx)
-    );
-
-    let blank = Line::from(Span::styled("", Style::default().bg(bg)));
-
-    if editing_title {
-        if let Some(edit) = &state.edit {
-            let title_line = Line::from(vec![
-                Span::styled("   ", Style::default().fg(fg).bg(bg)),
-                Span::styled(&edit.buffer, Style::default().fg(fg).bg(bg).add_modifier(Modifier::UNDERLINED)),
-            ]);
-            let counts_line = Line::from(vec![Span::styled(
-                format!("     {completed}/{total} completed"),
-                Style::default().fg(Color::Rgb(80, 80, 80)).bg(bg),
-            )]);
-            f.render_widget(
-                Paragraph::new(vec![blank, title_line, counts_line]).style(Style::default().bg(bg)),
-                visible,
-            );
-            let cy = visible.y + 1;
-            let cx = visible.x + 3 + edit.cursor as u16;
-            if cx < visible.x + visible.width && cy >= clip_area.y && cy < clip_area.y + clip_area.height {
-                f.set_cursor_position(Position::new(cx, cy));
-            }
-        }
+    // Background fill
+    let bg_style = if active {
+        Style::default().bg(bg).add_modifier(Modifier::BOLD)
     } else {
-        let marker = if is_selected && state.focus == Focus::ListSelector {
-            " > "
+        Style::default().bg(bg)
+    };
+    f.render_widget(Block::default().style(bg_style), visible);
+
+    // Title at y+1
+    if let Some(vis) = clip(clip_area, Rect::new(rect.x, rect.y + 1, rect.width, 1)) {
+        if let Some(edit) = state.edit.as_ref().filter(|e| e.is_rename_list(list_idx)) {
+            render_edit_line(
+                f, vis, clip_area,
+                vec![Span::styled("   ", Style::default().fg(fg).bg(bg))],
+                edit,
+                Style::default().fg(fg).bg(bg),
+                Style::default().bg(bg),
+            );
         } else {
-            "   "
-        };
+            let marker = if active { " > " } else { "   " };
+            let line = Line::from(vec![
+                Span::styled(marker, Style::default().fg(fg).add_modifier(Modifier::BOLD)),
+                Span::styled(&list.title, Style::default().fg(fg).add_modifier(Modifier::BOLD)),
+            ]);
+            f.render_widget(Paragraph::new(line).style(Style::default().bg(bg)), vis);
+        }
+    }
 
-        let title_line = Line::from(vec![
-            Span::styled(marker, Style::default().fg(fg).add_modifier(Modifier::BOLD)),
-            Span::styled(
-                &list.title,
-                Style::default().fg(fg).add_modifier(Modifier::BOLD),
-            ),
-        ]);
-
-        let counts_line = Line::from(vec![Span::styled(
+    // Counts at y+2
+    if let Some(vis) = clip(clip_area, Rect::new(rect.x, rect.y + 2, rect.width, 1)) {
+        let line = Line::from(Span::styled(
             format!("     {completed}/{total} completed"),
-            Style::default().fg(Color::Rgb(80, 80, 80)),
-        )]);
-
-        let selection_style = if is_selected && state.focus == Focus::ListSelector {
-            Style::default().bg(bg).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().bg(bg)
-        };
-
-        let para = Paragraph::new(vec![blank, title_line, counts_line])
-            .style(selection_style);
-
-        f.render_widget(para, visible);
+            Style::default().fg(Color::Rgb(80, 80, 80)).bg(bg),
+        ));
+        f.render_widget(Paragraph::new(line).style(Style::default().bg(bg)), vis);
     }
 }
 
@@ -240,36 +236,22 @@ fn draw_expanded_list(
     }
 
     // Title line (offset by 1 for spacing above)
-    let title_y = rect.y + 1;
-    let editing_title = matches!(
-        &state.edit,
-        Some(edit) if matches!(edit.target, EditTarget::RenameList { list_index } if list_index == list_idx)
-    );
-
-    if let Some(vis) = clip(clip_area, Rect::new(rect.x, title_y, rect.width, 1)) {
-        if editing_title {
-            if let Some(edit) = &state.edit {
-                let line = Line::from(vec![
-                    Span::styled("   ", Style::default().fg(fg).bg(bg)),
-                    Span::styled(&edit.buffer, Style::default().fg(fg).bg(bg).add_modifier(Modifier::UNDERLINED)),
-                ]);
-                f.render_widget(Paragraph::new(line).style(Style::default().bg(bg)), vis);
-                // Set cursor
-                let cx = vis.x + 3 + edit.cursor as u16;
-                if cx < vis.x + vis.width && vis.y >= clip_area.y && vis.y < clip_area.y + clip_area.height {
-                    f.set_cursor_position(Position::new(cx, vis.y));
-                }
-            }
+    if let Some(vis) = clip(clip_area, Rect::new(rect.x, rect.y + 1, rect.width, 1)) {
+        if let Some(edit) = state.edit.as_ref().filter(|e| e.is_rename_list(list_idx)) {
+            render_edit_line(
+                f, vis, clip_area,
+                vec![Span::styled("   ", Style::default().fg(fg).bg(bg))],
+                edit,
+                Style::default().fg(fg).bg(bg),
+                Style::default().bg(bg),
+            );
         } else {
             let marker = if is_selected { " < " } else { "   " };
             let line = Line::from(vec![
                 Span::styled(marker, Style::default().fg(fg).bg(bg)),
                 Span::styled(
                     &list.title,
-                    Style::default()
-                        .fg(fg)
-                        .bg(bg)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD),
                 ),
             ]);
             f.render_widget(Paragraph::new(line).style(Style::default().bg(bg)), vis);
@@ -287,27 +269,20 @@ fn draw_expanded_list(
             && state.focus == Focus::ItemList
             && selected_item == item_idx;
 
-        let editing_this = matches!(
-            &state.edit,
-            Some(edit) if matches!(edit.target, EditTarget::EditItem { list_index, item_index } if list_index == list_idx && item_index == item_idx)
-        );
-
         let checkbox = if item.completed { "[x] " } else { "[ ] " };
         let sel_marker = if is_item_selected { " > " } else { "   " };
 
-        if editing_this {
-            if let Some(edit) = &state.edit {
-                let line = Line::from(vec![
+        if let Some(edit) = state.edit.as_ref().filter(|e| e.is_edit_item(list_idx, item_idx)) {
+            render_edit_line(
+                f, vis, clip_area,
+                vec![
                     Span::styled(sel_marker, Style::default().fg(fg).bg(bg)),
                     Span::styled(checkbox, Style::default().fg(fg).bg(bg)),
-                    Span::styled(&edit.buffer, Style::default().fg(fg).bg(bg).add_modifier(Modifier::UNDERLINED)),
-                ]);
-                f.render_widget(Paragraph::new(line).style(Style::default().bg(bg)), vis);
-                let cx = vis.x + sel_marker.len() as u16 + checkbox.len() as u16 + edit.cursor as u16;
-                if cx < vis.x + vis.width && vis.y >= clip_area.y && vis.y < clip_area.y + clip_area.height {
-                    f.set_cursor_position(Position::new(cx, vis.y));
-                }
-            }
+                ],
+                edit,
+                Style::default().fg(fg).bg(bg),
+                Style::default().bg(bg),
+            );
         } else {
             let text_style = if item.completed {
                 Style::default()
@@ -343,23 +318,14 @@ fn draw_expanded_list(
             && state.focus == Focus::ItemList
             && selected_item == list.items.len();
 
-        let editing_new = matches!(
-            &state.edit,
-            Some(edit) if matches!(edit.target, EditTarget::NewItem { list_index } if list_index == list_idx)
-        );
-
-        if editing_new {
-            if let Some(edit) = &state.edit {
-                let line = Line::from(vec![
-                    Span::styled("   + ", Style::default().fg(fg).bg(bg)),
-                    Span::styled(&edit.buffer, Style::default().fg(fg).bg(bg).add_modifier(Modifier::UNDERLINED)),
-                ]);
-                f.render_widget(Paragraph::new(line).style(Style::default().bg(bg)), vis);
-                let cx = vis.x + 5 + edit.cursor as u16;
-                if cx < vis.x + vis.width && vis.y >= clip_area.y && vis.y < clip_area.y + clip_area.height {
-                    f.set_cursor_position(Position::new(cx, vis.y));
-                }
-            }
+        if let Some(edit) = state.edit.as_ref().filter(|e| e.is_new_item(list_idx)) {
+            render_edit_line(
+                f, vis, clip_area,
+                vec![Span::styled("    +  ", Style::default().fg(fg).bg(bg))],
+                edit,
+                Style::default().fg(fg).bg(bg),
+                Style::default().bg(bg),
+            );
         } else {
             let style = if is_add_selected {
                 Style::default()
@@ -369,10 +335,10 @@ fn draw_expanded_list(
             } else {
                 Style::default().fg(Color::Rgb(100, 100, 100)).bg(bg)
             };
-            let marker = if is_add_selected { " > " } else { "   " };
+            let marker = if is_add_selected { " >  " } else { "    " };
             let line = Line::from(vec![
                 Span::styled(marker, style),
-                Span::styled("+ Add New Item", style),
+                Span::styled("+  Add New Item", style),
             ]);
             f.render_widget(Paragraph::new(line).style(Style::default().bg(bg)), vis);
         }
@@ -384,23 +350,14 @@ fn draw_add_list_row(f: &mut Frame, clip_area: Rect, rect: Rect, state: &TuiStat
         return;
     };
 
-    let editing_new_list = matches!(
-        &state.edit,
-        Some(edit) if matches!(edit.target, EditTarget::NewList)
-    );
-
-    if editing_new_list {
-        if let Some(edit) = &state.edit {
-            let line = Line::from(vec![
-                Span::styled("  + ", Style::default().fg(Color::Green)),
-                Span::styled(&edit.buffer, Style::default().add_modifier(Modifier::UNDERLINED)),
-            ]);
-            f.render_widget(Paragraph::new(line), visible);
-            let cx = visible.x + 4 + edit.cursor as u16;
-            if cx < visible.x + visible.width && visible.y >= clip_area.y && visible.y < clip_area.y + clip_area.height {
-                f.set_cursor_position(Position::new(cx, visible.y));
-            }
-        }
+    if let Some(edit) = state.edit.as_ref().filter(|e| e.is_new_list()) {
+        render_edit_line(
+            f, visible, clip_area,
+            vec![Span::styled("  + ", Style::default().fg(Color::Green))],
+            edit,
+            Style::default(),
+            Style::default(),
+        );
     } else {
         let is_selected = state.on_add_list_row() && state.focus == Focus::ListSelector;
         let marker = if is_selected { "> " } else { "  " };
@@ -443,7 +400,7 @@ fn selected_y_range(state: &TuiState) -> (u16, u16) {
 
     for (i, list) in state.todo_state.lists.iter().enumerate() {
         let expanded = state.list_ui.get(i).is_some_and(|u| u.expanded);
-        let item_count = list.items.len() as u16;
+        let block_h = list_block_height(list.items.len() as u16, expanded);
 
         if i == state.selected_list {
             if expanded && state.focus == Focus::ItemList {
@@ -451,22 +408,11 @@ fn selected_y_range(state: &TuiState) -> (u16, u16) {
                 let item_y = y + LIST_HEADER_HEIGHT + sel;
                 return (item_y, item_y + 1);
             }
-            // Collapsed or list selector
-            let block_h = if expanded {
-                LIST_HEADER_HEIGHT + item_count * ITEM_HEIGHT + ADD_ITEM_ROW_HEIGHT + 1
-            } else {
-                COLLAPSED_HEIGHT
-            };
             return (y, y + block_h);
         }
 
-        if expanded {
-            y += LIST_HEADER_HEIGHT + item_count * ITEM_HEIGHT + ADD_ITEM_ROW_HEIGHT + 1;
-        } else {
-            y += COLLAPSED_HEIGHT;
-        }
+        y += block_h;
     }
 
-    // "Add list" row (beyond all lists, used when editing new list)
     (y, y + ADD_LIST_ROW_HEIGHT)
 }
