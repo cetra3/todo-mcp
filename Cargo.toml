@@ -1,6 +1,6 @@
 [package]
 name = "todo-mcp"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["cetra3 <cetra3@hotmail.com>"]
 description = "A Collaborative Todo List application and MCP server using CRDTs and Multicast"
 edition = "2024"
