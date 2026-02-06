@@ -2,7 +2,13 @@
 
 A collaborative todo list app built with Rust and [Dioxus](https://dioxuslabs.com/) that synchronizes state across devices using [Automerge](https://automerge.org/) CRDTs and UDP multicast. It also exposes an [MCP](https://modelcontextprotocol.io/) server interface, making your todo lists accessible to AI tools like Claude Code.
 
+Dioxus GUI
+
 ![](./todo-mcp.png)
+
+Ratatui TUI
+
+![](./todo-mcp-tui.png)
 
 ## Features
 
@@ -11,7 +17,10 @@ A collaborative todo list app built with Rust and [Dioxus](https://dioxuslabs.co
 - **MCP server** -- Exposes todo operations (`get_todos`, `add_todo`, `toggle_todo`, etc.) over stdio so AI assistants can read and manage your lists
 - **Claude Code hook** -- Bridges Claude Code's `TaskCreate`/`TaskUpdate` events into your todo lists, letting you track AI-generated tasks in the same UI
 - **Persistent storage** -- State is saved to disk as an Automerge document and restored on restart
+- **TUI mode** -- A full terminal UI built with [ratatui](https://ratatui.rs/) for managing todos without leaving the terminal, with vim-style keybindings and real-time sync
 - **Cross-platform** -- Builds for desktop (default), web, and mobile via Dioxus feature flags
+
+
 ## Installing
 
 You can install it from this git repo or using cargo:
@@ -38,6 +47,22 @@ dx serve --platform desktop
 
 ```bash
 dx serve --platform web
+```
+
+### TUI (terminal UI)
+
+Run an interactive terminal interface for managing your todo lists:
+
+```bash
+todo-mcp tui
+```
+
+Navigate with arrow keys or `j`/`k`, toggle items with `Space`, and press `q` to quit. The TUI syncs with other instances in real time just like the desktop and web apps.
+
+To build a minimal binary without the Dioxus GUI dependencies:
+
+```bash
+cargo build --no-default-features --features tui
 ```
 
 ### MCP server
