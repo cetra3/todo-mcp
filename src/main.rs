@@ -187,24 +187,12 @@ fn tui_main() {
 
     const FALLBACK_RUST_LOG: &str = concat!(env!("CARGO_CRATE_NAME"), "=DEBUG");
 
-    let debug_file = OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open("/tmp/todo-mcp.log")
-        .expect("Failed to open log file");
-
     // TUI: file-only logging
     tracing_subscriber::registry()
         .with(
             EnvFilter::builder()
                 .try_from_env()
                 .unwrap_or_else(|_| EnvFilter::new(FALLBACK_RUST_LOG)),
-        )
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_writer(debug_file)
-                .with_file(true)
-                .with_line_number(true),
         )
         .with(ErrorLayer::default())
         .init();

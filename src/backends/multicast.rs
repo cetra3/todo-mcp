@@ -387,7 +387,7 @@ pub async fn async_inner(
             result = read_task => {
                 // the write task has finished with the receiver, we need to reinitialize
                 if let Err(err) = result {
-                    change_tx.send(TodoEvent::ConnectionStatus("Error reading from network, trying reconnect in 10s".into())).await?;
+                    change_tx.send(TodoEvent::ConnectionStatus(format!("Error reading from network {err}, trying reconnect in 10s"))).await?;
                     error!("Error reading from multicast sleeping 10s and trying again, {err:?}");
                 }
             }
@@ -395,7 +395,7 @@ pub async fn async_inner(
 
                 // the write task has finished with the receiver, we need to reinitialize
                 if let Err(err) = result {
-                    change_tx.send(TodoEvent::ConnectionStatus("Error writing to network, trying reconnect in 10s".into())).await?;
+                    change_tx.send(TodoEvent::ConnectionStatus(format!("Error writing to network {err}, trying reconnect in 10s"))).await?;
                     error!("Error writing to multicast sleeping 10s and trying again, {err:?}");
                 }
             }
@@ -757,7 +757,8 @@ pub async fn write_notify(
             write_tx.try_send(oneshot_channel().0).ok();
         }
 
-        change_tx.send(to_send).await?;
+        // We don't want to block this task if the network is down
+        change_tx.try_send(to_send).ok();
     }
     Ok(())
 }
