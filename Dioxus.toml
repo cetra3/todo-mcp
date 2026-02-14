@@ -2,7 +2,7 @@
 android_manifest = "./AndroidManifest.xml"
 
 [bundle]
-identifier = "cetra.todomcp"
+identifier = "dev.cetra.todomcp"
 
 [web.app]
 

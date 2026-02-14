@@ -39,6 +39,7 @@ fs2 = "0.4.3"
 pin-project-lite = "0.2.16"
 anyhow = { version = "1.0.100", features = ["backtrace"] }
 netwatcher = "0.4.1"
+iroh = "0.96"
 
 # TUI
 ratatui = { version = "0.29", optional = true }

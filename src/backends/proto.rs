@@ -5,14 +5,21 @@ use std::{
     net::{Ipv4Addr, SocketAddr},
     pin::Pin,
     task::{Context, Poll},
+    time::Duration,
 };
 
 use futures::{ready, Stream};
 use pin_project_lite::pin_project;
 use serde::{de::DeserializeOwned, Serialize};
 use socket2::{Domain, Socket, Type};
-use tokio::{io::ReadBuf, net::UdpSocket};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
+    net::UdpSocket,
+    sync::mpsc::Sender as TokioSender,
+};
 use tracing::*;
+
+use super::multicast::SyncMessage;
 
 const BUF_SIZE: usize = 1400;
 
@@ -231,4 +238,139 @@ impl McastSender {
 
         Ok(())
     }
+}
+
+// --- Shared framing and connection loop for stream-based backends (iroh, IPC) ---
+
+/// Write a length-prefixed bincode message to any AsyncWrite stream.
+pub async fn write_message<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    msg: &SyncMessage,
+) -> anyhow::Result<()> {
+    let encoded = bincode::serde::encode_to_vec(msg, bincode::config::standard())?;
+    let len = (encoded.len() as u32).to_be_bytes();
+    writer.write_all(&len).await?;
+    writer.write_all(&encoded).await?;
+    Ok(())
+}
+
+/// Read a length-prefixed bincode message from any AsyncRead stream.
+/// Returns `Ok(None)` on graceful stream close.
+pub async fn read_message<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> anyhow::Result<Option<SyncMessage>> {
+    let mut len_buf = [0u8; 4];
+    match reader.read_exact(&mut len_buf).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            return Ok(None);
+        }
+        Err(e) => {
+            return Err(e.into());
+        }
+    }
+
+    let len = u32::from_be_bytes(len_buf) as usize;
+
+    if len > 64 * 1024 * 1024 {
+        anyhow::bail!("Message too large: {len} bytes");
+    }
+
+    let mut buf = vec![0u8; len];
+    reader.read_exact(&mut buf).await?;
+
+    let (msg, _) =
+        bincode::serde::decode_from_slice::<SyncMessage, _>(&buf, bincode::config::standard())?;
+
+    Ok(Some(msg))
+}
+
+/// Run a read/write/alive connection loop over any AsyncRead + AsyncWrite pair.
+///
+/// Spawns three tasks: read loop, write loop, and alive heartbeat.
+/// Blocks until any task completes, then sends a Shutdown message.
+pub async fn run_connection_loop<R, W>(
+    mut reader: R,
+    mut writer: W,
+    remote_site_id: u32,
+    inbound_tx: TokioSender<ProtoMessage<SyncMessage>>,
+    mut outbound_rx: tokio::sync::broadcast::Receiver<SyncMessage>,
+) where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    // Read loop
+    let read_inbound_tx = inbound_tx.clone();
+    let read_handle = tokio::spawn(async move {
+        loop {
+            match read_message(&mut reader).await {
+                Ok(Some(msg)) => {
+                    let proto_msg = ProtoMessage {
+                        site_id: remote_site_id,
+                        message: msg,
+                    };
+                    if read_inbound_tx.send(proto_msg).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    debug!("Read error from site_id={}: {e}", remote_site_id);
+                    break;
+                }
+            }
+        }
+    });
+
+    // Write loop (from broadcast)
+    let write_handle = tokio::spawn(async move {
+        loop {
+            match outbound_rx.recv().await {
+                Ok(msg) => {
+                    if let Err(e) = write_message(&mut writer, &msg).await {
+                        debug!("Write error: {e}");
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    warn!("Broadcast lagged by {n} messages");
+                }
+            }
+        }
+    });
+
+    // Alive heartbeat
+    let alive_inbound_tx = inbound_tx.clone();
+    let alive_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(2));
+        loop {
+            interval.tick().await;
+            if alive_inbound_tx
+                .send(ProtoMessage {
+                    site_id: remote_site_id,
+                    message: SyncMessage::Alive,
+                })
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    tokio::select! {
+        _ = read_handle => {}
+        _ = write_handle => {}
+        _ = alive_handle => {}
+    }
+
+    // Send Shutdown on disconnect
+    inbound_tx
+        .send(ProtoMessage {
+            site_id: remote_site_id,
+            message: SyncMessage::Shutdown,
+        })
+        .await
+        .ok();
 }

@@ -9,7 +9,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::hash::{Hash, Hasher};
 
 use tracing::*;
 
@@ -24,6 +25,10 @@ use tokio::sync::{Notify, RwLock};
 use autosurgeon::{Hydrate, Reconcile, hydrate, reconcile};
 use std::sync::Arc;
 
+use iroh::EndpointId;
+
+use crate::backends::ipc;
+use crate::backends::iroh as iroh_transport;
 use crate::backends::proto::{McastReceiver, McastSender, ProtoMessage};
 
 #[cfg(target_os = "android")]
@@ -115,7 +120,7 @@ pub enum TodoCommand {
     },
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum SyncMessage {
     DeltaChange(Vec<u8>),
     State(Vec<u8>),
@@ -144,7 +149,7 @@ pub fn setup(site_id: u32) -> (TokioSender<TodoCommand>, TokioReceiver<TodoEvent
 }
 
 pub struct SiteState {
-    commit: AutoCommit,
+    pub(crate) commit: AutoCommit,
     alive: BTreeMap<u32, Instant>,
 }
 
@@ -249,82 +254,15 @@ impl SiteState {
     }
 }
 
-type Site = Arc<RwLock<SiteState>>;
+pub type Site = Arc<RwLock<SiteState>>;
 
-/// # Task & Channel Architecture
-///
-/// `async_inner` spawns several tasks connected by mpsc channels and a Notify.
-/// Shared state (`Site = Arc<RwLock<SiteState>>`) is accessed by most tasks.
-///
-/// ```text
-///
-///  Caller (MCP server)
-///    |               ^
-///    | TodoCommand    | TodoEvent
-///    v               |
-///
-/// ==[change_rx]====[change_tx]==========================================
-/// |  async_inner                                                        |
-/// |                                                                     |
-/// |  +----------------+                         +--------------------+  |
-/// |  | write_notify   |---[m_write_tx]--------->| write_to_multicast |---->UDP
-/// |  | Applies local  |                    +--->| + Alive every 1s   |  |
-/// |  | edits to CRDT  |                    |    +--------------------+  |
-/// |  +-------+--------+                    |    (restarted by select!)  |
-/// |          |                             |                            |
-/// |          |--[file_write_tx]--+         |                            |
-/// |                              v         |                            |
-/// |                      +----------------+|                            |
-/// |                      | save_to_file   ||                            |
-/// |                      | _task          ||----> disk                  |
-/// |                      +----------------+|                            |
-/// |                              ^         |                            |
-/// |          +--[file_write_tx]--+         |                            |
-/// |          |                             |                            |
-/// |  +-------+-----------+---[m_write_tx]--+                            |
-/// |  | read_notify       |                      +--------------------+  |
-/// |  | Merges remote     |<--[multi_write_rx]---| read_from_multicast|<----UDP
-/// |  | CRDT changes      |                      +--------------------+  |
-/// |  | Sends State/Req   |                      (restarted by select!)  |
-/// |  | directly to mcast |                                              |
-/// |  |                   |                                              |
-/// |  | +---------------+ |                                              |
-/// |  | | aliveness sub | |                                              |
-/// |  | | prune every 1s| |                                              |
-/// |  | +---------------+ |                                              |
-/// |  +-------------------+                                              |
-/// |                                                                     |
-/// |  +-------------------+                                              |
-/// |  | network_watcher   |--[Arc<Notify>]--> select! loop restarts      |
-/// |  | OS interface      |                   read_from_multicast &      |
-/// |  | monitor           |                   write_to_multicast         |
-/// |  +-------------------+                                              |
-/// |                                                                     |
-/// =====================================================================
-///
-/// Channels (created in async_inner):
-///   file_write_tx/rx  : mpsc<OneshotSender<()>>(8) - trigger file save + ack
-///   m_write_tx/rx     : mpsc<SyncMessage>(8)       - outbound messages to network
-///   multi_write_tx/rx : mpsc<ProtoMessage>(8)      - inbound messages from network
-///   network_notify    : Arc<Notify>                - signals network interface changes
-///
-/// Channels (from caller):
-///   change_rx : Receiver<TodoCommand>  - commands from MCP server into write_notify
-///   change_tx : Sender<TodoEvent> - state updates back to MCP server
-///
-/// JoinSet tasks (run for lifetime of async_inner):
-///   1. save_to_file_task - persists CRDT state to disk on demand
-///   2. network_watcher   - monitors OS network interfaces, fires Notify
-///   3. write_notify      - processes local TodoCommands, mutates CRDT, sends Messages
-///   4. read_notify       - processes remote Messages, merges CRDT, emits TodoEvents
-///                          sends State/RequestState directly to m_write_tx
-///      +- aliveness sub  - prunes stale sites every 1s, updates AliveConnections count
-///
-/// Restart loop (select!):
-///   read_from_multicast & write_to_multicast are NOT in the JoinSet.
-///   They are polled in a select! loop and restarted (with 10s backoff
-///   or immediately on network change) if either future completes/errors.
-/// ```
+/// Multicast announcement message — only broadcasts EndpointId for LAN discovery.
+/// All actual data sync goes through iroh QUIC streams.
+#[derive(Serialize, Deserialize, Debug)]
+pub enum AnnouncementMessage {
+    IrohAnnounce([u8; 32]),
+}
+
 #[instrument(skip(change_tx, change_rx))]
 pub async fn async_inner(
     site_id: u32,
@@ -341,6 +279,10 @@ pub async fn async_inner(
     let (m_write_tx, mut m_write_rx) = tokio_channel::<SyncMessage>(128);
     let (multi_write_tx, multi_write_rx) = tokio_channel::<ProtoMessage<SyncMessage>>(128);
 
+    // Fan-out channels: outbound messages go to both iroh and IPC
+    let (iroh_outbound_tx, iroh_outbound_rx) = tokio_channel::<SyncMessage>(128);
+    let (ipc_outbound_tx, ipc_outbound_rx) = tokio_channel::<SyncMessage>(128);
+
     let network_notify = Arc::new(Notify::new());
 
     let site = Arc::new(RwLock::new(
@@ -349,8 +291,17 @@ pub async fn async_inner(
 
     let mut join_set = JoinSet::new();
 
+    // Fan-out task: m_write_rx -> iroh + IPC
+    join_set.spawn(async move {
+        while let Some(msg) = m_write_rx.recv().await {
+            iroh_outbound_tx.send(msg.clone()).await.ok();
+            ipc_outbound_tx.send(msg).await.ok();
+        }
+        Ok(())
+    });
+
     join_set.spawn(save_to_file_task(
-        file_location,
+        file_location.clone(),
         site.clone(),
         file_write_rx,
     ));
@@ -375,8 +326,30 @@ pub async fn async_inner(
         file_write_tx.clone(),
     ));
 
-    let mut read_task = read_from_multicast(multi_write_tx.clone());
-    let mut write_task = write_to_multicast(site_id, site.clone(), &mut m_write_rx);
+    // Setup IPC for same-machine sync
+    let storage_dir = file_location.parent().unwrap().to_path_buf();
+    join_set.spawn(ipc::setup_ipc(
+        site_id,
+        storage_dir,
+        site.clone(),
+        multi_write_tx.clone(),
+        ipc_outbound_rx,
+    ));
+
+    // Setup iroh — takes ownership of outbound and feeds inbound
+    let iroh_handle = iroh_transport::setup_iroh(site.clone(), multi_write_tx.clone(), iroh_outbound_rx).await?;
+
+    let our_endpoint_id = iroh_handle.our_endpoint_id;
+    let discovered_peer_tx = iroh_handle.discovered_peer_tx;
+
+    info!(
+        "Iroh endpoint ready: {}",
+        our_endpoint_id.fmt_short()
+    );
+
+    // Multicast is now announcement-only
+    let mut read_task = read_from_multicast_announce(discovered_peer_tx.clone());
+    let mut write_task = write_to_multicast_announce(site_id, our_endpoint_id);
 
     loop {
         tokio::select! {
@@ -385,18 +358,15 @@ pub async fn async_inner(
                 change_tx.send(TodoEvent::ConnectionStatus("Network status changed".into())).await?;
             }
             result = read_task => {
-                // the write task has finished with the receiver, we need to reinitialize
                 if let Err(err) = result {
-                    change_tx.send(TodoEvent::ConnectionStatus(format!("Error reading from network {err}, trying reconnect in 10s"))).await?;
-                    error!("Error reading from multicast sleeping 10s and trying again, {err:?}");
+                    change_tx.send(TodoEvent::ConnectionStatus(format!("Error reading announcements: {err}, trying reconnect in 10s"))).await?;
+                    error!("Error reading multicast announcements, sleeping 10s: {err:?}");
                 }
             }
             result = write_task => {
-
-                // the write task has finished with the receiver, we need to reinitialize
                 if let Err(err) = result {
-                    change_tx.send(TodoEvent::ConnectionStatus(format!("Error writing to network {err}, trying reconnect in 10s"))).await?;
-                    error!("Error writing to multicast sleeping 10s and trying again, {err:?}");
+                    change_tx.send(TodoEvent::ConnectionStatus(format!("Error writing announcements: {err}, trying reconnect in 10s"))).await?;
+                    error!("Error writing multicast announcements, sleeping 10s: {err:?}");
                 }
             }
         }
@@ -416,8 +386,8 @@ pub async fn async_inner(
             .send(TodoEvent::ConnectionStatus("Reconnecting".into()))
             .await?;
 
-        read_task = read_from_multicast(multi_write_tx.clone());
-        write_task = write_to_multicast(site_id, site.clone(), &mut m_write_rx);
+        read_task = read_from_multicast_announce(discovered_peer_tx.clone());
+        write_task = write_to_multicast_announce(site_id, our_endpoint_id);
     }
 }
 
@@ -486,6 +456,8 @@ pub async fn read_notify(
     write_tx: TokioSender<OneshotSender<()>>,
 ) -> Result<()> {
     let mut state_set = HashSet::new();
+    let mut seen_deltas = HashSet::<u64>::new();
+    let mut seen_deltas_order = VecDeque::<u64>::new();
     let mut join_set = JoinSet::new();
 
     let bg_site = site.clone();
@@ -524,12 +496,27 @@ pub async fn read_notify(
                 debug!("Site:{} DeltaChange:{}", incoming_site_id, val.len());
                 // If we've seen this site before
                 if state_set.contains(&incoming_site_id) {
-                    let mut wrt = site.write().await;
-                    wrt.commit.load_incremental(&val)?;
-
-                    let new_value: TodoState = hydrate(&wrt.commit)?;
-                    should_notify_save = true;
-                    change_tx.send(TodoEvent::StateUpdate(new_value)).await?;
+                    // Hash-based dedup: skip if we've already processed these exact bytes
+                    let delta_hash = {
+                        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                        val.hash(&mut hasher);
+                        hasher.finish()
+                    };
+                    if seen_deltas.insert(delta_hash) {
+                        seen_deltas_order.push_back(delta_hash);
+                        if seen_deltas_order.len() > 2048 {
+                            if let Some(old) = seen_deltas_order.pop_front() {
+                                seen_deltas.remove(&old);
+                            }
+                        }
+                        let mut wrt = site.write().await;
+                        wrt.commit.load_incremental(&val)?;
+                        let new_value: TodoState = hydrate(&wrt.commit)?;
+                        should_notify_save = true;
+                        change_tx.send(TodoEvent::StateUpdate(new_value)).await?;
+                        // Re-broadcast to all peers via fan-out (iroh + IPC)
+                        m_write_tx.send(SyncMessage::DeltaChange(val)).await?;
+                    }
                 } else {
                     // request the full state
                     m_write_tx
@@ -606,15 +593,26 @@ pub async fn read_notify(
     return Ok(());
 }
 
-// Reads packets from the multicast group and updates local state if necessary
+/// Reads multicast announcements and forwards discovered EndpointIds to iroh.
 #[instrument(skip_all)]
-pub async fn read_from_multicast(
-    multi_write_tx: TokioSender<ProtoMessage<SyncMessage>>,
+pub async fn read_from_multicast_announce(
+    discovered_peer_tx: TokioSender<EndpointId>,
 ) -> Result<()> {
-    let mut receiver = McastReceiver::<SyncMessage>::new()?;
+    let mut receiver = McastReceiver::<AnnouncementMessage>::new()?;
 
     while let Some(message) = receiver.try_next().await? {
-        multi_write_tx.send(message).await?;
+        match message.message {
+            AnnouncementMessage::IrohAnnounce(bytes) => {
+                match iroh::PublicKey::from_bytes(&bytes) {
+                    Ok(endpoint_id) => {
+                        discovered_peer_tx.send(endpoint_id).await?;
+                    }
+                    Err(e) => {
+                        warn!("Invalid endpoint ID in announcement: {e}");
+                    }
+                }
+            }
+        }
     }
 
     Ok(())
@@ -763,45 +761,19 @@ pub async fn write_notify(
     Ok(())
 }
 
+/// Broadcasts our iroh EndpointId over multicast every 2 seconds for LAN discovery.
 #[instrument(skip_all, fields(site_id = site_id))]
-pub async fn write_to_multicast(
+pub async fn write_to_multicast_announce(
     site_id: u32,
-    site: Site,
-    recv: &mut TokioReceiver<SyncMessage>,
+    endpoint_id: EndpointId,
 ) -> Result<()> {
     let mut mcast_sender = McastSender::new(site_id)?;
+    let mut announce_interval = tokio::time::interval(Duration::from_secs(2));
 
-    let mut announce_interval = tokio::time::interval(Duration::from_secs(1));
-
-    debug!("sending announce");
-    // send the initial announce message
-    mcast_sender
-        .send(SyncMessage::Announce(
-            site.read().await.commit.clone().save(),
-        ))
-        .await?;
+    let announce_msg = AnnouncementMessage::IrohAnnounce(*endpoint_id.as_bytes());
 
     loop {
-        tokio::select! {
-            _ = announce_interval.tick() => {
-                mcast_sender.send(SyncMessage::Alive).await?;
-            }
-
-            message = recv.recv() => {
-                if let Some(message) = message {
-                    match message {
-                        SyncMessage::Shutdown => {
-                            mcast_sender.send(message).await?;
-                            return Ok(());
-                        }
-                        other => {
-                            mcast_sender.send(other).await?;
-                        }
-                    }
-                } else {
-                    return Ok(())
-                }
-            }
-        }
+        announce_interval.tick().await;
+        mcast_sender.send(&announce_msg).await?;
     }
 }
